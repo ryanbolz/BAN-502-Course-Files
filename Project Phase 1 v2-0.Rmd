@@ -1,0 +1,267 @@
+---
+title: "RBolz - BAN502 Project"
+author: "Ryan Bolz"
+date: "2023-09-16"
+output: word_document
+---
+
+## Introduction
+This R markdown file and corresponding knitted document supports phase 1 of our BAN502 Project.  
+
+This project presents an opportunity to help the fictional company Keep It Dry improve its main product Super Soaker. The product is used in factories to absorb spills and leaks.
+
+The company has just completed a large testing study for different product prototypes. Can we use this data to build a model that predicts product failures?
+
+## Methodology
+1. Load data and call libraries
+2. Explore data structure
+3. Refine data structure for analysis
+3. Review variables for missingness and outliers
+4. Explore variable relationships
+
+## Setup: Load data files
+This section calls our needed libraries and reads in the training data set.
+  
+```{r setup, results = 'hide', message=FALSE}
+library(tidyverse)
+library(GGally)
+library(mice)
+library(skimr)
+train <- read_csv("train.csv")
+test <- read_csv("test.csv")
+```
+
+## Discovery: Describe Data Structure
+* Train data set has 26,570 observations with 26 variables
+* Test data set has 20,775 observations and 25 variables (missing the failure variable for us to populate later)
+* There is some variation across our attributes variable types
+* Our response variable is currently a character
+* Product values vary across the test and train data sets and are in various formats
+
+```{r}
+# Start with the high level structure view
+str(train)
+str(test)
+
+# High level view of data missingness
+skim(train)
+skim(test)
+
+# Let's also look at high level failures by product code for the train data set
+
+# This shows by count
+ggplot(train, aes(x=product_code, fill=failure)) +
+  geom_bar(position="stack") +
+  labs(title="Volume of Failures by Product Code",
+       x="Product Code",
+       y="Count") +
+  theme_minimal() +
+  scale_fill_manual(values=c("No"="green", "Yes"="red"), name="Failure Status")
+
+# This shows by proportion
+ggplot(train, aes(x=product_code, fill=failure)) +
+  geom_bar(position="fill") +
+  labs(title="Proportions of Failures by Product Code",
+       x="Product Code",
+       y="Proportion") +
+  theme_minimal() +
+  scale_fill_manual(values=c("No"="green", "Yes"="red"), name="Failure Status") +
+  scale_y_continuous(labels=scales::percent_format(scale=1))
+
+# Let's look at count of product codes in our test data set, knowing failures are not included here for relative comparison - Notice the product codes differ from the training set.
+
+ggplot(test, aes(x=product_code)) +
+  geom_bar() +
+  labs(title="Count of Product Codes in Test Data",
+       x="Product Code",
+       y="Count") +
+  theme_minimal()
+
+```
+
+```{r}
+# Let's review the values of products and attributes for the train data set
+
+review_attribute_train <- train %>%
+  group_by(product_code, attribute_0, attribute_1, attribute_2, attribute_3) %>%
+  summarise(count = n()) %>%
+  arrange(product_code, desc(count))
+
+review_attribute_train
+
+# Let's review the values of products and attributes for the test data set
+
+review_attribute_test <- test %>%
+  group_by(product_code, attribute_0, attribute_1, attribute_2, attribute_3) %>%
+  summarise(count = n()) %>%
+  arrange(product_code, desc(count))
+
+review_attribute_test
+
+```
+
+## Refine data structure for analysis
+* We need to define our attributes as factors and recode these for consistency
+* Our response variable is also a factor
+* The id and product_code variables can be removed as these will not be used as factors or measures
+
+
+```{r mutate}
+# First let's define our factors and recode to normalized values
+train2 <- train %>% 
+  mutate(attribute_0 = as_factor(attribute_0)) %>% 
+  mutate(attribute_1 = as_factor(attribute_1)) %>% 
+  mutate(attribute_2 = as_factor(attribute_2)) %>% 
+  mutate(attribute_2 = fct_recode(attribute_2, "material_9" = "9", "material_8" = "8", "material_5" = "5", "material_6" = "6")) %>% 
+  mutate(attribute_3 = as_factor(attribute_3)) %>% 
+  mutate(attribute_3 = fct_recode(attribute_3, "material_9" = "9", "material_8" = "8", "material_5" = "5", "material_6" = "6")) %>%
+  mutate(failure = as_factor(failure))
+
+# We can remove ID and Product Code because they will not be used as factors for any prediction, nor are they measurements.
+train2 <- train2 %>%
+  select(-id, -product_code)
+
+# We can also move the loading column so that it can more easily be included in column ranges for any imputation
+train2 <- train2 %>%
+  relocate(loading, .before = 6)
+
+str(train2)
+
+# Repeat these changes for the test data set, noting that the attribute_2 and attribute_3 variables have different values possibilities than the train data set; also the failure variable is not included in this file
+test2 <- test %>% 
+  mutate(attribute_0 = as_factor(attribute_0)) %>% 
+  mutate(attribute_1 = as_factor(attribute_1)) %>% 
+  mutate(attribute_2 = as_factor(attribute_2)) %>% 
+  mutate(attribute_2 = fct_recode(attribute_2, "material_9" = "9", "material_7" = "7", "material_6" = "6")) %>% 
+  mutate(attribute_3 = as_factor(attribute_3)) %>% 
+  mutate(attribute_3 = fct_recode(attribute_3, "material_9" = "9", "material_7" = "7", "material_5" = "5", "material_4" = "4"))
+
+# We can remove ID and Product Code because they will not be used as factors for any prediction, nor are they measurements.
+test2 <- test2 %>%
+  select(-id, -product_code)
+
+# We can also move the loading column so that it can more easily be included in column ranges for any imputation
+test2 <- test2 %>%
+  relocate(loading, .before = 6)
+
+str(test2)
+
+```
+
+## Review variables for missingness and outliers
+* All our factors have complete data
+* Loading is missing 250 values
+* A large range of missing values across measurement variables
+* Deploying PMM methodology for NA values may preserve more data as the values missing vary across column and row.
+* When you compare Median, Mean and Deviation between original data sets and imputed data sets, the variation seems marginal
+
+```{r}
+# High level view of data missingness
+skim(train2)
+summary(train2)
+
+# Let's impute missing values using predictive mean matching methodology
+
+set.seed(123) #sets seed for random number generator
+imp_train2 = mice(train2, m=10, method='pmm', printFlag=FALSE)
+#m is the number of imputations, 5 is a reasonable value as a default but we pushed to 10 to improve accuracy
+#pmm is "predictive mean matching" = imputation method for numeric data
+#printFlag reduces amount of output
+
+train_final = complete(imp_train2) 
+summary(train_final)
+skim(train_final)
+
+
+#Let's repeat for the test data set.
+skim(test2)
+summary(test2)
+
+# Let's impute missing values using predictive mean matching methodology
+
+set.seed(123) #sets seed for random number generator
+imp_test2 = mice(test2, m=10, method='pmm', printFlag=FALSE)
+# m is the number of imputations, 5 is a reasonable value as a default but we pushed to 10 to improve accuracy
+# pmm is "predictive mean matching" = imputation method for numeric data
+# printFlag reduces amount of output
+
+test_final = complete(imp_test2) 
+summary(test_final)
+skim(test_final)
+```
+
+## Explore variable relationships
+* Now that data is fairly orderly, lets evaluate the impact of certain variables on our response variable
+* A regression assessment shows loading and measurement_17 as most likely having a strong relationship with failure
+* Measurement_8, measurement_5, measurement_4, measurement_7, measurement_6 and measurement_9 all are stat sig as well
+* Our visualizations demonstrate that there does seem to be a noticeable relationship of the loading amount and measurement_17 that increases the liklihood of a failure as these values increase
+* Other variables with significant results do not demonstrate as stark of a relationship
+
+```{r}
+
+# A quick linear regression can help us identify likely variables that interact with our response variable failure
+model <- glm(failure ~ ., data = train_final, family = "binomial")
+summary(model)
+
+# Lets plot our two variables that had the strongest relationship to failure: loading and measurement_17
+
+ggplot(train_final, aes(x=loading, y=failure)) +
+  geom_boxplot() +
+  labs(title="Boxplot of Loading by Failure Status") +
+  theme_minimal()
+
+ggplot(train_final, aes(x=measurement_17, y=failure)) +
+  geom_boxplot() +
+  labs(title="Boxplot of Measurement 17 by Failure Status") +
+  theme_minimal()
+
+# Some of the other variables that had strong relationships do not seem to be as variable in outcomes on failure
+
+ggplot(train_final, aes(x=measurement_8, y=failure)) +
+  geom_boxplot() +
+  labs(title="Boxplot of Measurement 8 by Failure Status") +
+  theme_minimal()
+
+ggplot(train_final, aes(x=measurement_5, y=failure)) +
+  geom_boxplot() +
+  labs(title="Boxplot of Measurement 5 by Failure Status") +
+  theme_minimal()
+
+ggplot(train_final, aes(x=measurement_7, y=failure)) +
+  geom_boxplot() +
+  labs(title="Boxplot of Measurement 7 by Failure Status") +
+  theme_minimal()
+```
+
+
+I was also curious on reviewing attribute_2, given material_9 did demonstrate a mild relationship to failure.
+* From a grouped bar chart, material_6 actually has more total failures.
+* Reviewing as a proportion of total failures by material, you can see material_9 mildly stand out with a greater proportion of failures.
+* The relationship is not as clear as those seen with the loading and measurement_17 variables
+
+```{r}
+
+
+ggplot(train_final, aes(x=attribute_2, fill=failure)) +
+  geom_bar(position="stack") +
+  labs(title="Grouped Bar Chart of Attribute_0 by Failure Status",
+       x="Attribute_2",
+       y="Count") +
+  theme_minimal()
+
+attribte_2_summary <- train_final %>%
+  group_by(attribute_2) %>%
+  summarize(total = n(),
+            failures = sum(failure == "Yes"),
+            failure_proportion = failures / total) 
+
+ggplot(attribte_2_summary, aes(x=attribute_2, y=failure_proportion)) +
+  geom_bar(stat="identity", fill="steelblue") +
+  labs(title="Proportion of Failures by Attribute_2",
+       x="Attribute_2",
+       y="Proportion of Failures") +
+  theme_minimal() +
+  scale_y_continuous(labels=scales::percent)
+
+
+```
